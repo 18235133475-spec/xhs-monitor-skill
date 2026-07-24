@@ -13,8 +13,9 @@
 | 探索页 | `/(?:explore\|discovery\/item)\/([0-9a-f]{24})` | 主页卡片、搜索结果 |
 | 主页内链 | `/user/profile/[0-9a-f]{24}/([0-9a-f]{24})` | 新版个人主页卡片 |
 
-详情页 URL 必须带 `xsec_token` 参数，否则 404。token 会过期：
-weekly.py 每次运行先重扫主页刷新链接，daily.py 依赖当日卡片链接，均不落库旧 token 复用。
+详情页 URL 必须带 `xsec_token` 参数，否则 404；token 约 5 分钟过期且与入口动作绑定。
+因此 v1.1 起不再存储/复用详情 URL：daily 与 weekly 均通过点击主页卡片开模态进入详情
+（URL 模式仅用于从卡片 href 识别 note_id，不用于导航）。
 
 ## 2. 字段选择器回退表
 
@@ -45,6 +46,17 @@ weekly.py 每次运行先重扫主页刷新链接，daily.py 依赖当日卡片�
 
 ## 4. 风控信号关键词
 
-`滑块` / `安全验证` / `操作频繁` / `账号异常` / `环境异常`，
-命中即熔断（见 runtime-rules.md §4）。关键词清单在 `common.detect_block`，
-遇到新形式的风控文案时往里追加。
+- 页面级风控：`滑块` / `安全验证` / `操作频繁` / `账号异常` / `环境异常`
+  （`common.detect_block`，命中即熔断）
+- 详情页扫码墙：`当前笔记暂时无法浏览` / `笔记暂时无法浏览` / `请打开小红书App扫码查看` / `App扫码查看`
+  （`common.detect_detail_unavailable`，命中走冷却重试，见 runtime-rules.md §4）
+
+遇到新形式的风控文案时往对应清单追加。
+
+## 5. 模态说明
+
+v1.1 起详情一律走「主页点击卡片 → SPA 弹模态」。模态打开后当前笔记的
+engage-bar 在 document 内唯一，`EXTRACT_DETAIL_JS` 无需改动即可命中；
+关闭模态用 Escape（`close_note_modal`）。若模态打不开，优先检查卡片锚点
+`a[href*="{note_id}"]` 是否仍存在于主页 DOM（翻屏深度不够时老帖不在，属正常，
+weekly.py 会计入 `skipped_unseen`）。

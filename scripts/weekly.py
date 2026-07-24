@@ -1,8 +1,9 @@
 """周刷：回访全部在监测笔记刷新指标，并生成环比周报。
 
-流程：校验登录 → 先扫各账号主页刷新详情页链接（xsec_token 会过期）
-     → 回访 max_age_days 天内全部在册笔记详情页，追加 metrics.jsonl
-     → 与 7 天前快照比对算环比 → 生成 Markdown 周报到 knowledge-base/reports/。
+流程：校验登录 → 逐账号扫主页（多翻几屏覆盖老帖）→ 对在册笔记逐一点击卡片
+     开模态刷新指标（禁止直跳 URL，xsec_token 过期问题随之消失）
+     → 追加 metrics.jsonl → 与 7 天前快照比对算环比
+     → 生成 Markdown 周报到 knowledge-base/reports/。
 """
 import os
 import sys
@@ -12,8 +13,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import (STATE_DIR, NOTES_PATH, METRICS_PATH, REPORTS_DIR, CST,
                     ensure_playwright, launch, check_login, detect_block,
                     human_delay, append_jsonl, load_jsonl, load_config,
-                    parse_count, today_str, EXTRACT_CARDS_JS, EXTRACT_DETAIL_JS,
-                    emit)  # noqa: E402
+                    parse_count, today_str, open_note_modal, close_note_modal,
+                    extract_detail_guarded, validate_detail, confidence,
+                    save_validation_shot, EXTRACT_CARDS_JS, emit)  # noqa: E402
 
 
 def note_age_days(note, today_d):
@@ -113,6 +115,7 @@ def main():
     rate = cfg.get("rate", {})
     delay = (rate.get("min_delay", 3), rate.get("max_delay", 7))
     budget = rate.get("weekly_detail_budget", 120)
+    cooldown = rate.get("wall_cooldown_seconds", 90)
     wcfg = cfg.get("weekly", {})
     max_age = wcfg.get("max_age_days", 90)
     top_n = wcfg.get("top_n", 3)
@@ -126,7 +129,14 @@ def main():
         emit(status="ok", message="库内无在监测笔记，请先跑 daily.py", refreshed=0)
         return
 
+    by_account = {}
+    for n in active:
+        by_account.setdefault(n["account"], []).append(n)
+
     errors, refreshed = [], 0
+    val = {"total_details": 0, "bad_details": 0, "detail_wall_hits": 0,
+           "screenshots": [], "skipped_unseen": 0}
+
     with sync_playwright() as pw:
         browser, ctx = launch(pw, state_file)
         page = ctx.new_page()
@@ -136,11 +146,10 @@ def main():
             browser.close()
             return
 
-        # 先扫各账号主页，刷新详情页链接（xsec_token 过期会导致旧链接 404）
-        fresh_url = {}
         for acc in cfg.get("accounts", []):
-            url = acc.get("profile_url", "")
-            if "/user/profile/" not in url:
+            name, url = acc.get("name"), acc.get("profile_url", "")
+            acc_notes = by_account.get(name, [])
+            if not acc_notes or "/user/profile/" not in url:
                 continue
             try:
                 page.goto(url, timeout=45000, wait_until="domcontentloaded")
@@ -148,48 +157,61 @@ def main():
                 for _ in range(max_scrolls * 2):  # 周刷多翻几屏，覆盖老帖
                     page.mouse.wheel(0, 2500)
                     page.wait_for_timeout(1500)
-                for c in page.evaluate(EXTRACT_CARDS_JS):
-                    fresh_url[c["note_id"]] = c["url"]
-                human_delay(*delay)
+                seen = {c["note_id"] for c in page.evaluate(EXTRACT_CARDS_JS)}
             except Exception as e:
-                errors.append({"account": acc.get("name"), "error": f"主页刷新失败: {e}"})
-
-        if detect_block(page):
-            emit(status="blocked", message="刷新链接时触发风控，已熔断。请手动验证后明日再试。")
-            browser.close()
-            return
-
-        for n in active:
-            if budget <= 0:
-                errors.append({"error": "详情页访问预算耗尽，其余笔记下周优先刷新"})
-                break
-            budget -= 1
-            url = fresh_url.get(n["note_id"], n.get("url", ""))
-            if not url:
+                errors.append({"account": name, "error": f"主页扫描失败: {e}"})
                 continue
-            try:
-                page.goto(url, timeout=45000, wait_until="domcontentloaded")
-                page.wait_for_timeout(3500)
-                if "/login" in page.url:
-                    emit(status="need_login", message="登录态中途失效，请重新登录")
-                    browser.close()
-                    return
-                d = page.evaluate(EXTRACT_DETAIL_JS)
-            except Exception as e:
-                errors.append({"note_id": n["note_id"], "error": f"详情页失败: {e}"})
-                continue
+
             if detect_block(page):
-                emit(status="blocked", message="详情页回访触发风控，已熔断。请手动验证后明日再试。")
+                emit(status="blocked", message="扫描主页时触发风控，已熔断。请手动验证后明日再试。")
                 browser.close()
                 return
-            append_jsonl(METRICS_PATH, {
-                "note_id": n["note_id"], "account": n["account"], "date": today_s,
-                "likes": parse_count(d.get("like")),
-                "collects": parse_count(d.get("collect")),
-                "comments": parse_count(d.get("comment")),
-                "views": None, "source": "frontend",
-            })
-            refreshed += 1
+
+            for n in acc_notes:
+                if n["note_id"] not in seen:
+                    val["skipped_unseen"] += 1  # 翻屏深度内未出现的老帖，下周优先
+                    continue
+                if budget <= 0:
+                    errors.append({"error": "详情页访问预算耗尽，其余笔记下周优先刷新"})
+                    break
+                budget -= 1
+                try:
+                    open_note_modal(page, n["note_id"])
+                except Exception as e:
+                    errors.append({"note_id": n["note_id"], "error": f"模态打开失败: {e}"})
+                    continue
+
+                d, walled = extract_detail_guarded(page, n["note_id"], cooldown)
+                val["total_details"] += 1
+                if walled:
+                    val["detail_wall_hits"] += 1
+                    shot = save_validation_shot(page, n["note_id"])
+                    if shot:
+                        val["screenshots"].append(shot)
+                    emit(status="blocked",
+                         message="详情页持续命中「App 扫码查看」风控墙，已熔断。"
+                                 "建议 1-2 小时后或明日恢复；可用 XHS_HEADLESS=0 有头模式降低触发率。")
+                    browser.close()
+                    return
+
+                if validate_detail(d):
+                    val["bad_details"] += 1
+                    shot = save_validation_shot(page, n["note_id"])
+                    if shot:
+                        val["screenshots"].append(shot)
+                    errors.append({"note_id": n["note_id"], "error": "自检字段缺失，已记录截图"})
+
+                append_jsonl(METRICS_PATH, {
+                    "note_id": n["note_id"], "account": n["account"], "date": today_s,
+                    "likes": parse_count(d.get("like")) if d else None,
+                    "collects": parse_count(d.get("collect")) if d else None,
+                    "comments": parse_count(d.get("comment")) if d else None,
+                    "views": None, "source": "frontend",
+                })
+                refreshed += 1
+                close_note_modal(page)
+                human_delay(*delay)
+
             human_delay(*delay)
 
         browser.close()
@@ -202,9 +224,10 @@ def main():
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report)
 
+    val["overall_confidence"] = confidence(val["total_details"], val["bad_details"])
     status = "ok" if not errors else ("partial" if refreshed else "failed")
     emit(status=status, date=today_s, refreshed=refreshed, active_notes=len(active),
-         report=report_path, errors=errors[:10])
+         report=report_path, validation=val, errors=errors[:10])
 
 
 if __name__ == "__main__":

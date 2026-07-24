@@ -1,8 +1,9 @@
 """日抓：发现各监测账号的新发布笔记，并采集其首组互动指标。
 
 流程：校验登录 → 逐账号抓主页笔记列表（evaluate 一次提取）
-     → 与 notes.jsonl 比对识别新增 → 仅对新增笔记进详情页采「赞/藏/评/发布时间」
-     → 追加 notes.jsonl / metrics.jsonl → 输出 JSON 摘要。
+     → 与 notes.jsonl 比对识别新增 → 对新增笔记「点击卡片开模态」采赞/藏/评/发布时间
+     （禁止直跳详情页 URL，会触发 App 扫码风控墙）
+     → 追加 notes.jsonl / metrics.jsonl → 输出 JSON 摘要（含 validation 自检）。
 存量笔记的指标刷新由 weekly.py 负责，日抓不重复回访。
 """
 import os
@@ -12,7 +13,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import (STATE_DIR, NOTES_PATH, METRICS_PATH, ensure_playwright, launch,
                     check_login, detect_block, human_delay, append_jsonl, load_jsonl,
                     load_config, parse_count, parse_publish_time, today_str,
-                    EXTRACT_CARDS_JS, EXTRACT_DETAIL_JS, emit)  # noqa: E402
+                    open_note_modal, close_note_modal, extract_detail_guarded,
+                    validate_detail, confidence, save_validation_shot,
+                    EXTRACT_CARDS_JS, emit)  # noqa: E402
 
 
 def scan_profile(page, profile_url, max_scrolls):
@@ -23,12 +26,6 @@ def scan_profile(page, profile_url, max_scrolls):
         page.mouse.wheel(0, 2500)
         page.wait_for_timeout(1800)
     return page.evaluate(EXTRACT_CARDS_JS)
-
-
-def visit_detail(page, url):
-    page.goto(url, timeout=45000, wait_until="domcontentloaded")
-    page.wait_for_timeout(3500)
-    return page.evaluate(EXTRACT_DETAIL_JS)
 
 
 def main():
@@ -50,11 +47,14 @@ def main():
     delay = (rate.get("min_delay", 3), rate.get("max_delay", 7))
     budget = rate.get("daily_detail_budget", 30)
     max_scrolls = cfg.get("daily", {}).get("max_scrolls", 6)
+    cooldown = rate.get("wall_cooldown_seconds", 90)
 
     known = {n["note_id"] for n in load_jsonl(NOTES_PATH)}
     today = today_str()
     summary = {"status": "ok", "date": today, "accounts": [], "new_notes": 0,
                "errors": []}
+    val = {"total_details": 0, "bad_details": 0, "detail_wall_hits": 0,
+           "screenshots": []}
 
     with sync_playwright() as pw:
         browser, ctx = launch(pw, state_file)
@@ -91,34 +91,53 @@ def main():
                     break
                 budget -= 1
                 try:
-                    d = visit_detail(page, c["url"])
+                    open_note_modal(page, c["note_id"])
                 except Exception as e:
                     summary["errors"].append({"account": name, "note_id": c["note_id"],
-                                              "error": f"详情页失败: {e}"})
+                                              "error": f"模态打开失败: {e}"})
                     continue
-                if detect_block(page):
+
+                d, walled = extract_detail_guarded(page, c["note_id"], cooldown)
+                val["total_details"] += 1
+                if walled:
+                    val["detail_wall_hits"] += 1
+                    shot = save_validation_shot(page, c["note_id"])
+                    if shot:
+                        val["screenshots"].append(shot)
                     emit(status="blocked",
-                         message="详情页抓取触发风控，已熔断。请手动完成一次验证，明日再恢复。")
+                         message="详情页持续命中「App 扫码查看」风控墙（冷却重试后仍被拦截），已熔断。"
+                                 "建议 1-2 小时后或明日恢复任务；本地跑可用 XHS_HEADLESS=0 有头模式降低触发率。")
                     browser.close()
                     return
+
+                missing = validate_detail(d)
+                if missing:
+                    val["bad_details"] += 1
+                    shot = save_validation_shot(page, c["note_id"])
+                    if shot:
+                        val["screenshots"].append(shot)
+                    summary["errors"].append({"account": name, "note_id": c["note_id"],
+                                              "error": f"自检缺失字段: {','.join(missing)}"})
 
                 note = {
                     "note_id": c["note_id"], "url": c["url"],
                     "account": name, "type": acc.get("type", "competitor"),
-                    "title": d.get("title") or c.get("title") or "",
-                    "publish_time": parse_publish_time(d.get("date")),
+                    "title": (d.get("title") or c.get("title") or "") if d else c.get("title", ""),
+                    "publish_time": parse_publish_time(d.get("date")) if d else None,
                     "first_seen": today,
                 }
                 append_jsonl(NOTES_PATH, note)
                 append_jsonl(METRICS_PATH, {
                     "note_id": c["note_id"], "account": name, "date": today,
-                    "likes": parse_count(d.get("like")) or parse_count(c.get("likes_text")),
-                    "collects": parse_count(d.get("collect")),
-                    "comments": parse_count(d.get("comment")),
+                    "likes": (parse_count(d.get("like")) if d else None)
+                             or parse_count(c.get("likes_text")),
+                    "collects": parse_count(d.get("collect")) if d else None,
+                    "comments": parse_count(d.get("comment")) if d else None,
                     "views": None, "source": "frontend",
                 })
                 known.add(c["note_id"])
                 acc_new += 1
+                close_note_modal(page)
                 human_delay(*delay)
 
             summary["accounts"].append({
@@ -128,9 +147,11 @@ def main():
 
         browser.close()
 
+    val["overall_confidence"] = confidence(val["total_details"], val["bad_details"])
+    summary["validation"] = val
     if summary["errors"] and summary["new_notes"] == 0 and not summary["accounts"]:
         summary["status"] = "failed"
-    elif summary["errors"]:
+    elif summary["errors"] or val["bad_details"]:
         summary["status"] = "partial"
     emit(**summary)
 
