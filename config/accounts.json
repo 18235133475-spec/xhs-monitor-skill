@@ -12,8 +12,9 @@
       "profile_url": "https://www.xiaohongshu.com/user/profile/填入user_id"
     }
   ],
-  "daily": {
-    "max_scrolls": 6
+  "scroll": {
+    "max_rounds": 40,
+    "stable_rounds": 2
   },
   "weekly": {
     "max_age_days": 90,

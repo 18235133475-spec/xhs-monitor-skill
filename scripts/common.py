@@ -5,6 +5,10 @@
   XHS_RUNTIME_DIR  运行目录（默认 /mnt/agents/xhs-monitor；macOS 可设 ~/.openclaw/...）
   XHS_HEADLESS     "0" 表示有头模式（本地 Mac 调试用，指纹更干净；默认无头）
   XHS_CHROME_PATH  指定浏览器可执行文件路径（如 /Applications/Google Chrome.app/...）
+
+v1.2：登录态改用持久化浏览器 profile（state/profile/），完整保留 cookies、
+localStorage、IndexedDB 与设备指纹，且每次运行指纹一致，显著优于 storage_state。
+注意：同一账号必须固定同一种运行模式（有头/无头二选一），混用会被平台降级。
 """
 import json
 import os
@@ -18,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 
 RUNTIME_DIR = os.environ.get("XHS_RUNTIME_DIR", "/mnt/agents/xhs-monitor")
 STATE_DIR = os.path.join(RUNTIME_DIR, "state")
+PROFILE_DIR = os.path.join(STATE_DIR, "profile")
 DATA_DIR = os.path.join(RUNTIME_DIR, "knowledge-base")
 CONFIG_PATH = os.path.join(RUNTIME_DIR, "accounts.json")
 NOTES_PATH = os.path.join(DATA_DIR, "notes.jsonl")
@@ -34,6 +39,10 @@ Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh']});
 """
 
 CST = timezone(timedelta(hours=8))  # 东八区，定时任务环境可能为 UTC
+
+
+class LoginWallError(Exception):
+    """主页滚动时撞「登录即可查看 Ta 的笔记」：登录态掉线/被降级。"""
 
 
 def today_str():
@@ -62,18 +71,50 @@ def chromium_path():
     raise RuntimeError("未找到系统 Chromium，可用环境变量 XHS_CHROME_PATH 指定浏览器路径")
 
 
+def has_login_state():
+    """是否存在可用登录态：持久化 profile（优先）或旧版 observer.json。"""
+    if os.path.isdir(PROFILE_DIR) and os.listdir(PROFILE_DIR):
+        return True
+    return os.path.exists(os.path.join(STATE_DIR, "observer.json"))
+
+
 def launch(pw, state_file=None):
+    """启动浏览器。返回 (browser, ctx)；persistent 模式下 browser 为 None，
+    关闭时统一调用 shutdown(browser, ctx)。
+
+    优先使用持久化 profile（登录态完整、指纹一致）；profile 不存在时回落
+    storage_state（兼容 v1.0/v1.1 的 observer.json）。
+    """
     headless = os.environ.get("XHS_HEADLESS", "1") != "0"
-    browser = pw.chromium.launch(
-        executable_path=chromium_path(), headless=headless,
-        args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+    exe = chromium_path()
+    args = ["--no-sandbox", "--disable-blink-features=AutomationControlled"]
     kwargs = dict(user_agent=UA, viewport={"width": 1440, "height": 900},
                   locale="zh-CN", timezone_id="Asia/Shanghai")
-    if state_file and os.path.exists(state_file):
-        kwargs["storage_state"] = state_file
+
+    if os.path.isdir(PROFILE_DIR) and os.listdir(PROFILE_DIR):
+        try:
+            ctx = pw.chromium.launch_persistent_context(
+                PROFILE_DIR, executable_path=exe, headless=headless, args=args, **kwargs)
+            ctx.add_init_script(STEALTH_JS)
+            return None, ctx
+        except Exception:
+            pass  # 某些挂载盘不支持 Chromium profile（如缺 symlink），回落
+
+    browser = pw.chromium.launch(executable_path=exe, headless=headless, args=args)
+    legacy = state_file or os.path.join(STATE_DIR, "observer.json")
+    if os.path.exists(legacy):
+        kwargs["storage_state"] = legacy
     ctx = browser.new_context(**kwargs)
     ctx.add_init_script(STEALTH_JS)
     return browser, ctx
+
+
+def shutdown(browser, ctx):
+    try:
+        ctx.close()
+    finally:
+        if browser is not None:
+            browser.close()
 
 
 def save_state(ctx, state_file):
@@ -103,6 +144,18 @@ def detect_block(page):
         return False
 
 
+# 主页「登录墙」：登录态掉线/被降级时出现，此时滚动不会有任何新卡片
+LOGIN_WALL_KEYS = ("登录即可查看", "登录后即可查看")
+
+
+def detect_login_wall(page):
+    try:
+        t = page.evaluate("() => document.body.innerText.slice(0, 600)")
+        return any(k in t for k in LOGIN_WALL_KEYS)
+    except Exception:
+        return False
+
+
 # 详情页「App 扫码墙」关键词：命中说明详情被平台临时风控，不是选择器失效。
 # 该墙可恢复（冷却一段时间后可再访问），处理流程见 runtime-rules.md §4。
 DETAIL_WALL_KEYS = ("当前笔记暂时无法浏览", "笔记暂时无法浏览",
@@ -127,15 +180,47 @@ def cool_down(seconds=90):
     time.sleep(seconds)
 
 
+# ---------------- 主页滚动采集 ----------------
+
+def scroll_collect_cards(page, max_rounds=40, stable_rounds=2, wait_ms=1800):
+    """滚动主页采集卡片，直到连续 stable_rounds 轮卡片数不再增长（或达上限）。
+    撞登录墙抛 LoginWallError。返回去重后的卡片列表。"""
+    cards, last_count, stable = {}, -1, 0
+    for _ in range(max_rounds):
+        if detect_login_wall(page):
+            raise LoginWallError("主页弹出登录墙，登录态掉线或被平台降级")
+        for c in page.evaluate(EXTRACT_CARDS_JS):
+            cards[c["note_id"]] = c
+        if len(cards) == last_count:
+            stable += 1
+            if stable >= stable_rounds:
+                break
+        else:
+            stable = 0
+            last_count = len(cards)
+        page.mouse.wheel(0, 2200)
+        page.wait_for_timeout(wait_ms)
+    return list(cards.values())
+
+
 # ---------------- 详情页模态操作 ----------------
 # 铁律：禁止直接 goto 详情页 URL（xsec_token 与入口动作绑定，直跳必撞墙）。
 # 一律在主页/列表页点击卡片，让 SPA 弹模态，token 上下文由点击动作自然生成。
 
 def open_note_modal(page, note_id):
-    """在当前列表页点击对应笔记卡片，打开详情模态。"""
-    loc = page.locator(f'a[href*="{note_id}"]').first
-    loc.scroll_into_view_if_needed(timeout=8000)
-    loc.click(timeout=8000)
+    """在当前列表页点击对应笔记卡片，打开详情模态。locator 失败降级 JS 点击。"""
+    sel = f'a[href*="{note_id}"]'
+    try:
+        loc = page.locator(sel).first
+        loc.scroll_into_view_if_needed(timeout=6000)
+        loc.click(timeout=6000)
+    except Exception:
+        page.evaluate("""(sel) => {
+            const el = document.querySelector(sel);
+            if (!el) throw new Error('anchor not found: ' + sel);
+            el.scrollIntoView({block: 'center'});
+            el.click();
+        }""", sel)
     page.wait_for_timeout(3500)
 
 

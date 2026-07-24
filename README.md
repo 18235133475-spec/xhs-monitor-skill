@@ -29,15 +29,24 @@ curl -L https://raw.githubusercontent.com/18235133475-spec/xhs-monitor-skill/mai
 | 变量 | 作用 |
 |---|---|
 | `XHS_RUNTIME_DIR` | 覆盖运行目录（默认 `/mnt/agents/xhs-monitor`；macOS 示例 `~/.openclaw/workspace/agents/xhs-monitor`），无需改源码 |
-| `XHS_HEADLESS` | 设 `0` 为有头模式（本地 Mac 推荐，撞风控墙率低） |
+| `XHS_HEADLESS` | 设 `0` 为有头模式（本地 Mac 推荐，撞风控墙率低）。**登录与日常运行必须固定同一模式** |
 | `XHS_CHROME_PATH` | 指定浏览器路径，如 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` |
 
-## v1.1 变更（2026-07-24）
+## 变更记录
 
-- **详情页改模态点击进入**：禁止直跳详情 URL（xsec_token 与入口动作绑定，直跳必触发「请打开小红书App扫码查看」风控墙），改为主页点击卡片开模态提取
-- **撞墙冷却重试**：命中扫码墙冷却 90 秒重试一次，仍命中才熔断
-- **自检机制**：`validate_detail` 字段校验 + 失败截图存证 + validation 置信度报告
-- **路径/浏览器环境变量化**：`XHS_RUNTIME_DIR` / `XHS_HEADLESS` / `XHS_CHROME_PATH`
-- weekly 不再依赖存储的详情 URL，xsec_token 过期问题消除
+### v1.2（2026-07-24）
+
+- **滚动到底采集**：`scroll_collect_cards` 滚动至连续两轮不再加载新卡片（修复「只采到首屏 18 篇」——那是固定 6 次滚动的结果，不是平台限量）
+- **持久化 profile 登录态**：整个浏览器用户目录落盘（cookies/IndexedDB/设备指纹），解决扫码登录态几分钟掉线问题；不支持的挂载盘自动回落 storage_state
+- **登录墙识别**：主页弹「登录即可查看 Ta 的笔记」即报 `need_login`，不再把 0 篇当正常结果
+- **模态点击加固**：locator 失败自动降级 JS 点击
+- **登录态纪律**：同一账号固定有头/无头模式，混用会被平台降级
+
+### v1.1（2026-07-24）
+
+- 详情页改模态点击进入：禁止直跳详情 URL（xsec_token 与入口动作绑定，直跳必触发「请打开小红书App扫码查看」风控墙）
+- 撞扫码墙冷却 90 秒重试一次，仍命中才熔断
+- 自检机制：`validate_detail` 字段校验 + 失败截图存证 + validation 置信度报告
+- 路径/浏览器环境变量化
 
 运行规则、选择器维护、数据 schema 详见 `references/` 目录。

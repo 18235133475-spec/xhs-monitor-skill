@@ -1,7 +1,7 @@
 """周刷：回访全部在监测笔记刷新指标，并生成环比周报。
 
-流程：校验登录 → 逐账号扫主页（多翻几屏覆盖老帖）→ 对在册笔记逐一点击卡片
-     开模态刷新指标（禁止直跳 URL，xsec_token 过期问题随之消失）
+流程：校验登录 → 逐账号滚动主页采集卡片（滚到不再加载，覆盖老帖）
+     → 对 90 天内在册笔记逐一点击卡片开模态刷新指标（禁止直跳 URL）
      → 追加 metrics.jsonl → 与 7 天前快照比对算环比
      → 生成 Markdown 周报到 knowledge-base/reports/。
 """
@@ -10,12 +10,13 @@ import sys
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (STATE_DIR, NOTES_PATH, METRICS_PATH, REPORTS_DIR, CST,
-                    ensure_playwright, launch, check_login, detect_block,
-                    human_delay, append_jsonl, load_jsonl, load_config,
-                    parse_count, today_str, open_note_modal, close_note_modal,
-                    extract_detail_guarded, validate_detail, confidence,
-                    save_validation_shot, EXTRACT_CARDS_JS, emit)  # noqa: E402
+from common import (NOTES_PATH, METRICS_PATH, REPORTS_DIR, CST,
+                    ensure_playwright, launch, shutdown, has_login_state,
+                    check_login, detect_block, human_delay, append_jsonl,
+                    load_jsonl, load_config, parse_count, today_str,
+                    scroll_collect_cards, LoginWallError,
+                    open_note_modal, close_note_modal, extract_detail_guarded,
+                    validate_detail, confidence, save_validation_shot, emit)  # noqa: E402
 
 
 def note_age_days(note, today_d):
@@ -107,8 +108,7 @@ def main():
         emit(status="config_missing", message=str(e))
         return
 
-    state_file = os.path.join(STATE_DIR, "observer.json")
-    if not os.path.exists(state_file):
+    if not has_login_state():
         emit(status="need_login", message="未找到登录态，请先运行 login_bootstrap.py")
         return
 
@@ -119,7 +119,9 @@ def main():
     wcfg = cfg.get("weekly", {})
     max_age = wcfg.get("max_age_days", 90)
     top_n = wcfg.get("top_n", 3)
-    max_scrolls = cfg.get("daily", {}).get("max_scrolls", 6)
+    scroll = cfg.get("scroll", {})
+    max_rounds = scroll.get("max_rounds", 40)
+    stable_rounds = scroll.get("stable_rounds", 2)
 
     today_s = today_str()
     today_d = datetime.now(CST).date()
@@ -138,12 +140,13 @@ def main():
            "screenshots": [], "skipped_unseen": 0}
 
     with sync_playwright() as pw:
-        browser, ctx = launch(pw, state_file)
-        page = ctx.new_page()
+        browser, ctx = launch(pw)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
         if not check_login(page):
-            emit(status="need_login", message="登录态已失效，请重新运行 login_bootstrap.py")
-            browser.close()
+            emit(status="need_login",
+                 message="登录态已失效或被平台降级，请重新运行 login_bootstrap.py 扫码")
+            shutdown(browser, ctx)
             return
 
         for acc in cfg.get("accounts", []):
@@ -154,22 +157,26 @@ def main():
             try:
                 page.goto(url, timeout=45000, wait_until="domcontentloaded")
                 page.wait_for_timeout(4000)
-                for _ in range(max_scrolls * 2):  # 周刷多翻几屏，覆盖老帖
-                    page.mouse.wheel(0, 2500)
-                    page.wait_for_timeout(1500)
-                seen = {c["note_id"] for c in page.evaluate(EXTRACT_CARDS_JS)}
+                cards = scroll_collect_cards(page, max_rounds, stable_rounds)
+                seen = {c["note_id"] for c in cards}
+            except LoginWallError:
+                emit(status="need_login",
+                     message=f"扫描账号「{name}」主页时弹出登录墙，登录态掉线或被降级。"
+                             "请重新运行 login_bootstrap.py，并确认运行模式（有头/无头）与登录时一致。")
+                shutdown(browser, ctx)
+                return
             except Exception as e:
                 errors.append({"account": name, "error": f"主页扫描失败: {e}"})
                 continue
 
             if detect_block(page):
                 emit(status="blocked", message="扫描主页时触发风控，已熔断。请手动验证后明日再试。")
-                browser.close()
+                shutdown(browser, ctx)
                 return
 
             for n in acc_notes:
                 if n["note_id"] not in seen:
-                    val["skipped_unseen"] += 1  # 翻屏深度内未出现的老帖，下周优先
+                    val["skipped_unseen"] += 1  # 滚动到底仍未出现（可能被作者删除/隐藏）
                     continue
                 if budget <= 0:
                     errors.append({"error": "详情页访问预算耗尽，其余笔记下周优先刷新"})
@@ -191,7 +198,7 @@ def main():
                     emit(status="blocked",
                          message="详情页持续命中「App 扫码查看」风控墙，已熔断。"
                                  "建议 1-2 小时后或明日恢复；可用 XHS_HEADLESS=0 有头模式降低触发率。")
-                    browser.close()
+                    shutdown(browser, ctx)
                     return
 
                 if validate_detail(d):
@@ -214,7 +221,7 @@ def main():
 
             human_delay(*delay)
 
-        browser.close()
+        shutdown(browser, ctx)
 
     metrics = load_jsonl(METRICS_PATH)
     report = build_report(notes, metrics, today_s, top_n)

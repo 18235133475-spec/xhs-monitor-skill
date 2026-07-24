@@ -14,6 +14,8 @@ xiaohongshu-ops 的 evaluate 提取与风控熔断思路，按监测场景做了
 - 运行目录：默认 `/mnt/agents/xhs-monitor/`，可用环境变量 `XHS_RUNTIME_DIR` 覆盖
   （如 macOS 设 `~/.openclaw/workspace/agents/xhs-monitor/`），不要改源码
 - 浏览器：Playwright + 系统 Chromium，脚本首次运行自动安装 playwright
+- 登录态：持久化浏览器 profile（`state/profile/`），cookies/IndexedDB/设备指纹
+  全部落盘。**同一账号必须固定同一种运行模式（有头/无头二选一），混用会被平台降级掉线**
 - 环境变量：`XHS_HEADLESS=0` 有头模式（本地 Mac 推荐，撞风控墙率低）；
   `XHS_CHROME_PATH` 指定浏览器路径（如 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`）
 
@@ -37,7 +39,7 @@ xiaohongshu-ops 的 evaluate 提取与风控熔断思路，按监测场景做了
 python3 <技能目录>/scripts/daily.py
 ```
 
-校验登录 → 逐账号抓主页笔记列表（evaluate 一次提取）→ 比对库内识别新增 →
+校验登录 → 逐账号滚动主页采集卡片（滚到连续两轮不再加载为止）→ 比对库内识别新增 →
 对新增笔记**点击卡片开模态**采「赞/藏/评/发布时间」（禁止直跳详情页 URL，必撞扫码墙）
 → 追加 notes.jsonl / metrics.jsonl。
 完成后向用户汇报：各账号新增几篇、标题列表、当前互动值、validation 置信度。
@@ -49,7 +51,7 @@ python3 <技能目录>/scripts/daily.py
 python3 <技能目录>/scripts/weekly.py
 ```
 
-逐账号扫主页（多翻几屏覆盖老帖）→ 对 90 天内在册笔记逐一点击开模态刷新指标
+逐账号滚动主页到底（覆盖全部老帖）→ 对 90 天内在册笔记逐一点击开模态刷新指标
 → 与 7 天前快照算环比 → 生成 Markdown 周报到 `knowledge-base/reports/`。
 完成后把周报内容推送给用户，重点讲：各账号互动增量、赞增量 TOP 帖、
 异常波动（增量为 null 或骤降的帖）、validation 置信度与 skipped_unseen（翻屏未覆盖的老帖数）。
@@ -60,7 +62,7 @@ python3 <技能目录>/scripts/weekly.py
 |---|---|---|
 | `ok` | 正常完成 | 汇报摘要 |
 | `partial` | 部分条目失败 | 汇报成功与跳过明细，已获数据保留 |
-| `need_login` | 登录态失效 | 重跑 login_bootstrap.py 并展示二维码 |
+| `need_login` | 登录态失效/被降级 | 重跑 login_bootstrap.py 并展示二维码；保持运行模式与登录时一致 |
 | `blocked` | 触发风控（含详情页扫码墙冷却重试后仍命中） | 立即停止，只报告一个手动动作；扫码墙建议 1-2 小时后或明日恢复，滑块类当日不得重试 |
 | `config_missing` | 配置缺失 | 回到「首次配置」第 1-2 步 |
 

@@ -50,6 +50,8 @@
   （`common.detect_block`，命中即熔断）
 - 详情页扫码墙：`当前笔记暂时无法浏览` / `笔记暂时无法浏览` / `请打开小红书App扫码查看` / `App扫码查看`
   （`common.detect_detail_unavailable`，命中走冷却重试，见 runtime-rules.md §4）
+- 主页登录墙：`登录即可查看` / `登录后即可查看`
+  （`common.detect_login_wall`，命中抛 `LoginWallError` → 报 `need_login`，见 runtime-rules.md §5）
 
 遇到新形式的风控文案时往对应清单追加。
 

@@ -27,13 +27,20 @@
 - 登录态失效（`need_login`）→ 重跑 login_bootstrap.py，把二维码图展示给用户扫码，不要尝试账号密码登录。
 - 本地 Mac 调试可用 `XHS_HEADLESS=0` 有头模式 + `XHS_CHROME_PATH` 指定真 Chrome，指纹更干净，撞墙率显著低于无头。
 
-## 5. 浏览器稳定规则
+## 5. 登录态纪律（v1.2 新增，血泪教训）
+
+- 登录态用持久化 profile（`state/profile/`）存储，不要再手动导出/注入 cookies。
+- **同一账号固定一种运行模式**：登录时有头，之后运行就都有头；登录时无头，之后就都无头。同一份登录态在两种指纹环境间切换，会被平台判定异常并降级掉线。
+- 主页滚动中撞「登录即可查看 Ta 的笔记」= 登录态掉线/被降级（`LoginWallError`），输出 `need_login` 重新扫码；不要把「采到 0 篇」当正常结果。
+- 笔记总数以「滚动到连续两轮不再加载新卡片」为准（`scroll_collect_cards`）；固定次数滚动得到的首屏数量不是账号真实笔记总量。
+
+## 6. 浏览器稳定规则
 
 - 使用系统 Chromium + Playwright，启动参数固定含 `--disable-blink-features=AutomationControlled`，注入 webdriver 抹除脚本（common.py 已实现，勿删）。
 - 页面加载用 `domcontentloaded` + 固定等待，不用 `networkidle`（小红书长连接多，易超时）。
 - 同一运行内复用同一 page 串行访问，不开多 tab 并发。
 
-## 6. 数据纪律
+## 7. 数据纪律
 
 - 只追加不改写：notes.jsonl / metrics.jsonl 均为 append-only，历史快照永不动，环比才有意义。
 - 指标解析失败写 `null`，禁止编造数字。

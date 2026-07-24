@@ -1,6 +1,6 @@
 """日抓：发现各监测账号的新发布笔记，并采集其首组互动指标。
 
-流程：校验登录 → 逐账号抓主页笔记列表（evaluate 一次提取）
+流程：校验登录 → 逐账号滚动主页采集卡片（滚到不再加载为止）
      → 与 notes.jsonl 比对识别新增 → 对新增笔记「点击卡片开模态」采赞/藏/评/发布时间
      （禁止直跳详情页 URL，会触发 App 扫码风控墙）
      → 追加 notes.jsonl / metrics.jsonl → 输出 JSON 摘要（含 validation 自检）。
@@ -10,22 +10,13 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (STATE_DIR, NOTES_PATH, METRICS_PATH, ensure_playwright, launch,
-                    check_login, detect_block, human_delay, append_jsonl, load_jsonl,
-                    load_config, parse_count, parse_publish_time, today_str,
-                    open_note_modal, close_note_modal, extract_detail_guarded,
-                    validate_detail, confidence, save_validation_shot,
-                    EXTRACT_CARDS_JS, emit)  # noqa: E402
-
-
-def scan_profile(page, profile_url, max_scrolls):
-    """打开账号主页，滚动加载后一次 evaluate 提取全部笔记卡片。"""
-    page.goto(profile_url, timeout=45000, wait_until="domcontentloaded")
-    page.wait_for_timeout(4000)
-    for _ in range(max_scrolls):
-        page.mouse.wheel(0, 2500)
-        page.wait_for_timeout(1800)
-    return page.evaluate(EXTRACT_CARDS_JS)
+from common import (NOTES_PATH, METRICS_PATH, ensure_playwright, launch, shutdown,
+                    has_login_state, check_login, detect_block, human_delay,
+                    append_jsonl, load_jsonl, load_config, parse_count,
+                    parse_publish_time, today_str, scroll_collect_cards,
+                    LoginWallError, open_note_modal, close_note_modal,
+                    extract_detail_guarded, validate_detail, confidence,
+                    save_validation_shot, emit)  # noqa: E402
 
 
 def main():
@@ -38,16 +29,17 @@ def main():
         emit(status="config_missing", message=str(e))
         return
 
-    state_file = os.path.join(STATE_DIR, "observer.json")
-    if not os.path.exists(state_file):
+    if not has_login_state():
         emit(status="need_login", message="未找到登录态，请先运行 login_bootstrap.py")
         return
 
     rate = cfg.get("rate", {})
     delay = (rate.get("min_delay", 3), rate.get("max_delay", 7))
     budget = rate.get("daily_detail_budget", 30)
-    max_scrolls = cfg.get("daily", {}).get("max_scrolls", 6)
     cooldown = rate.get("wall_cooldown_seconds", 90)
+    scroll = cfg.get("scroll", {})
+    max_rounds = scroll.get("max_rounds", 40)
+    stable_rounds = scroll.get("stable_rounds", 2)
 
     known = {n["note_id"] for n in load_jsonl(NOTES_PATH)}
     today = today_str()
@@ -57,12 +49,13 @@ def main():
            "screenshots": []}
 
     with sync_playwright() as pw:
-        browser, ctx = launch(pw, state_file)
-        page = ctx.new_page()
+        browser, ctx = launch(pw)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
         if not check_login(page):
-            emit(status="need_login", message="登录态已失效，请重新运行 login_bootstrap.py")
-            browser.close()
+            emit(status="need_login",
+                 message="登录态已失效或被平台降级，请重新运行 login_bootstrap.py 扫码")
+            shutdown(browser, ctx)
             return
 
         for acc in cfg.get("accounts", []):
@@ -71,7 +64,15 @@ def main():
                 summary["errors"].append({"account": name, "error": "profile_url 未配置或非法"})
                 continue
             try:
-                cards = scan_profile(page, url, max_scrolls)
+                page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                page.wait_for_timeout(4000)
+                cards = scroll_collect_cards(page, max_rounds, stable_rounds)
+            except LoginWallError:
+                emit(status="need_login",
+                     message=f"抓取账号「{name}」时主页弹出登录墙，登录态掉线或被降级。"
+                             "请重新运行 login_bootstrap.py，并确认运行模式（有头/无头）与登录时一致。")
+                shutdown(browser, ctx)
+                return
             except Exception as e:
                 summary["errors"].append({"account": name, "error": f"主页抓取失败: {e}"})
                 continue
@@ -79,8 +80,13 @@ def main():
             if detect_block(page):
                 emit(status="blocked",
                      message=f"抓取账号「{name}」时触发风控，已熔断。请手动打开小红书完成一次验证，明日再恢复任务。")
-                browser.close()
+                shutdown(browser, ctx)
                 return
+
+            if not cards:
+                summary["errors"].append({"account": name,
+                                          "error": "未采到任何卡片（页面结构异常或未加载），已跳过"})
+                continue
 
             new_cards = [c for c in cards if c["note_id"] not in known]
             acc_new = 0
@@ -107,7 +113,7 @@ def main():
                     emit(status="blocked",
                          message="详情页持续命中「App 扫码查看」风控墙（冷却重试后仍被拦截），已熔断。"
                                  "建议 1-2 小时后或明日恢复任务；本地跑可用 XHS_HEADLESS=0 有头模式降低触发率。")
-                    browser.close()
+                    shutdown(browser, ctx)
                     return
 
                 missing = validate_detail(d)
@@ -145,7 +151,7 @@ def main():
             summary["new_notes"] += acc_new
             human_delay(*delay)
 
-        browser.close()
+        shutdown(browser, ctx)
 
     val["overall_confidence"] = confidence(val["total_details"], val["bad_details"])
     summary["validation"] = val
