@@ -1,0 +1,28 @@
+{
+  "accounts": [
+    {
+      "name": "示例-自有账号",
+      "type": "own",
+      "profile_url": "https://www.xiaohongshu.com/user/profile/填入user_id",
+      "creator": false
+    },
+    {
+      "name": "示例-竞品账号",
+      "type": "competitor",
+      "profile_url": "https://www.xiaohongshu.com/user/profile/填入user_id"
+    }
+  ],
+  "daily": {
+    "max_scrolls": 6
+  },
+  "weekly": {
+    "max_age_days": 90,
+    "top_n": 3
+  },
+  "rate": {
+    "min_delay": 3,
+    "max_delay": 7,
+    "daily_detail_budget": 30,
+    "weekly_detail_budget": 120
+  }
+}
