@@ -9,6 +9,7 @@
 v1.2：登录态改用持久化浏览器 profile（state/profile/），完整保留 cookies、
 localStorage、IndexedDB 与设备指纹，且每次运行指纹一致，显著优于 storage_state。
 注意：同一账号必须固定同一种运行模式（有头/无头二选一），混用会被平台降级。
+v1.3：卡片标题改「标题锚点自取」，详情标题砍掉 h1 宽泛兜底（标题错位事故修复）。
 """
 import json
 import os
@@ -285,25 +286,42 @@ def save_validation_shot(page, note_id):
 
 # ---------------- 提取脚本（选择器失效时只改这里，维护方法见 references/selectors.md） ----------------
 
-# 账号主页笔记卡片：扫描所有锚点，按 URL 模式识别笔记 ID，容器内取标题与赞数
+# 账号主页笔记卡片：按 URL 模式识别笔记 ID。
+# v1.3 修复：标题不再从模糊容器里 querySelector（容器解析错误会导致标题串行错位），
+# 改为「标题锚点自取」——页脚标题本身就是 href 含 note_id、类名含 title 的 <a>；
+# 兜底用封面 img 的 alt（XHS 封面 alt 即笔记标题）。赞数仍从卡片容器取（容错）。
 EXTRACT_CARDS_JS = r"""() => {
   const items = new Map();
+  const pickId = (href) => {
+    let m = (href || '').match(/\/(?:explore|discovery\/item)\/([0-9a-f]{24})/);
+    if (!m) m = (href || '').match(/\/user\/profile\/[0-9a-f]{24}\/([0-9a-f]{24})/);
+    return m ? m[1] : null;
+  };
   for (const a of document.querySelectorAll('a[href]')) {
-    const href = a.getAttribute('href') || '';
-    let m = href.match(/\/(?:explore|discovery\/item)\/([0-9a-f]{24})/);
-    if (!m) m = href.match(/\/user\/profile\/[0-9a-f]{24}\/([0-9a-f]{24})/);
-    if (!m) continue;
-    const id = m[1];
-    if (items.has(id)) continue;
-    const card = a.closest('section') || a.closest('[class*="note"]') || a;
-    const q = (sel) => card.querySelector(sel)?.textContent?.trim() || '';
-    const imgAlt = card.querySelector('img')?.getAttribute('alt')?.trim() || '';
-    items.set(id, {
-      note_id: id,
-      url: href.startsWith('http') ? href : 'https://www.xiaohongshu.com' + href,
-      title: q('.title') || q('[class*="title"]') || imgAlt || (a.getAttribute('title') || '').trim(),
-      likes_text: q('.like-wrapper .count') || q('[class*="like"] .count') || q('.count')
-    });
+    const id = pickId(a.getAttribute('href'));
+    if (!id) continue;
+    const item = items.get(id) || {note_id: id, url: '', title: '', likes_text: ''};
+    if (!item.url) {
+      const href = a.getAttribute('href');
+      item.url = href.startsWith('http') ? href : 'https://www.xiaohongshu.com' + href;
+    }
+    // 主路径：标题锚点（类名含 title 的链接）自身文本
+    if (!item.title && /title/i.test(a.className || '')) {
+      const t = (a.textContent || '').trim();
+      if (t) item.title = t;
+    }
+    // 兜底：封面图 alt
+    if (!item.title) {
+      const alt = a.querySelector('img')?.getAttribute('alt')?.trim();
+      if (alt) item.title = alt;
+    }
+    if (!item.likes_text) {
+      const card = a.closest('section') || a;
+      const like = card.querySelector('.like-wrapper .count')
+                || card.querySelector('[class*="like"] .count');
+      if (like) item.likes_text = like.textContent.trim();
+    }
+    items.set(id, item);
   }
   return [...items.values()];
 }"""
@@ -319,7 +337,7 @@ EXTRACT_DETAIL_JS = r"""() => {
     return '';
   };
   return {
-    title: pick(['#detail-title', '.note-content .title', 'h1[class*="title"]', 'h1']),
+    title: pick(['#detail-title', '.note-content .title']),
     author: pick(['.author-container .username', '.username', '[class*="author"] [class*="name"]']),
     date: pick(['.bottom-container .date', '.date', '[class*="date"]']),
     like: pick(['.engage-bar .like-wrapper .count', '.like-wrapper .count', '[class*="like-wrapper"] .count']),

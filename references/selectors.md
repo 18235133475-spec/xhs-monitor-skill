@@ -23,9 +23,9 @@
 
 | 字段 | 选择器（按优先级） |
 |---|---|
-| 卡片标题 | `.title` → `[class*="title"]` → 卡片 img 的 alt → 锚点 title 属性 |
-| 卡片赞数 | `.like-wrapper .count` → `[class*="like"] .count` → `.count` |
-| 详情标题 | `#detail-title` → `.note-content .title` → `h1[class*="title"]` → `h1` |
+| 卡片标题 | **标题锚点自身文本**（类名含 `title` 且 href 同含 note_id 的 `<a>`）→ 封面 img 的 alt（v1.3 起。废弃容器内 `.title` 查询：容器解析错误会取到别篇标题，曾引发标题错位事故） |
+| 卡片赞数 | `.like-wrapper .count` → `[class*="like"] .count` |
+| 详情标题 | `#detail-title` → `.note-content .title`（仅此两个。v1.3 起砍掉 `h1` 系列兜底：实测会命中正文小标题） |
 | 作者 | `.author-container .username` → `.username` → `[class*="author"] [class*="name"]` |
 | 发布日期 | `.bottom-container .date` → `.date` → `[class*="date"]` |
 | 点赞 | `.engage-bar .like-wrapper .count` → `.like-wrapper .count` |

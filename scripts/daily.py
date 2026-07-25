@@ -125,10 +125,19 @@ def main():
                     summary["errors"].append({"account": name, "note_id": c["note_id"],
                                               "error": f"自检缺失字段: {','.join(missing)}"})
 
+                # v1.3 标题一致性校验：卡片标题与详情标题不一致时记录差异，
+                # 以详情页标题为准（详情页选择器经过实测验证，见 selectors.md §2）
+                card_title = (c.get("title") or "").strip()
+                detail_title = (d.get("title") or "").strip() if d else ""
+                if card_title and detail_title and card_title != detail_title:
+                    summary["errors"].append({
+                        "account": name, "note_id": c["note_id"],
+                        "error": f"title_mismatch: 卡片[{card_title[:20]}] != 详情[{detail_title[:20]}]，已采用详情标题"})
+
                 note = {
                     "note_id": c["note_id"], "url": c["url"],
                     "account": name, "type": acc.get("type", "competitor"),
-                    "title": (d.get("title") or c.get("title") or "") if d else c.get("title", ""),
+                    "title": detail_title or card_title,
                     "publish_time": parse_publish_time(d.get("date")) if d else None,
                     "first_seen": today,
                 }
