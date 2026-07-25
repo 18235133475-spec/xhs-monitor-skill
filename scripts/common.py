@@ -253,6 +253,25 @@ def close_note_modal(page):
     page.wait_for_timeout(1200)
 
 
+def on_profile_page(page):
+    """当前是否仍在账号主页。撞详情墙时 XHS 会把路由 pushState 跳走，
+    此时主页卡片列表整体消失，任何锚点点击/滚动都会空转。"""
+    return "/user/profile/" in (page.url or "")
+
+
+def recover_profile(page, profile_url, wait_ms=4000):
+    """详情墙/路由跳走后恢复账号主页：先尝试后退，回不去就直接 goto。"""
+    try:
+        if not on_profile_page(page):
+            page.go_back(timeout=15000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+    except Exception:
+        pass
+    if not on_profile_page(page) or detect_detail_unavailable(page):
+        page.goto(profile_url, timeout=45000, wait_until="domcontentloaded")
+        page.wait_for_timeout(wait_ms)
+
+
 def extract_detail_guarded(page, note_id, cooldown_seconds=90):
     """模态内提取详情；撞扫码墙则冷却重试一次。
     返回 (data, walled)：walled=True 表示冷却重试后仍被拦截，调用方应熔断。

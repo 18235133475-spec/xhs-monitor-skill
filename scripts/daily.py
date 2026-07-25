@@ -15,7 +15,8 @@ from common import (NOTES_PATH, METRICS_PATH, ensure_playwright, launch, shutdow
                     parse_publish_time, today_str, iterate_profile_cards,
                     LoginWallError, open_note_modal, close_note_modal,
                     extract_detail_guarded, validate_detail, confidence,
-                    save_validation_shot, emit)  # noqa: E402
+                    save_validation_shot, on_profile_page, recover_profile,
+                    emit)  # noqa: E402
 
 
 def main():
@@ -69,12 +70,14 @@ def main():
                 summary["errors"].append({"account": name, "error": f"主页打开失败: {e}"})
                 continue
 
-            run = {"budget": budget, "stop": None, "acc_new": 0}
+            run = {"budget": budget, "stop": None, "acc_new": 0,
+                   "recover": None, "failed": set()}
 
             def on_card(c):
-                """对当前 DOM 内的一张新卡片立即处理；返回 False 中止整个账号。"""
+                """对当前 DOM 内的一张新卡片立即处理；返回 False 中止本轮迭代。
+                run["recover"] 置位表示页面已离开主页，需回主页恢复后重新迭代。"""
                 nid = c["note_id"]
-                if nid in known:
+                if nid in known or nid in run["failed"]:
                     return True
                 if run["budget"] <= 0:
                     summary["errors"].append({"account": name,
@@ -86,6 +89,11 @@ def main():
                 except Exception as e:
                     summary["errors"].append({"account": name, "note_id": nid,
                                               "error": f"模态打开失败: {e}"})
+                    run["failed"].add(nid)
+                    if not on_profile_page(page):
+                        # v1.4.2：撞墙后路由被跳走，必须回主页恢复，否则整轮空转
+                        run["recover"] = "left_profile"
+                        return False
                     return True
 
                 try:
@@ -94,6 +102,10 @@ def main():
                     # v1.4.1 总兜底：单卡任何异常只记错误、跳过，绝不中止整轮
                     summary["errors"].append({"account": name, "note_id": nid,
                                               "error": f"详情提取失败: {e}"})
+                    run["failed"].add(nid)
+                    if not on_profile_page(page):
+                        run["recover"] = "left_profile"
+                        return False
                     close_note_modal(page)
                     return True
                 val["total_details"] += 1
@@ -106,11 +118,12 @@ def main():
                     return False
 
                 if d is None:
-                    # 冷却重开后卡片被回收：不入库、不标记 known，明日补抓
+                    # 冷却重开后卡片被回收/页面跳走：不入库，回主页恢复后继续其余卡
                     summary["errors"].append({"account": name, "note_id": nid,
-                                              "error": "冷却重开后卡片已回收，跳过待明日补抓"})
-                    close_note_modal(page)
-                    return True
+                                              "error": "撞墙冷却重开失败，回主页恢复后继续，本条明日补抓"})
+                    run["failed"].add(nid)
+                    run["recover"] = "card_recycled"
+                    return False
 
                 missing = validate_detail(d)
                 if missing:
@@ -150,17 +163,36 @@ def main():
                 human_delay(*delay)
                 return True
 
-            try:
-                cards, _ = iterate_profile_cards(page, on_card, max_rounds, stable_rounds)
-            except LoginWallError:
-                emit(status="need_login",
-                     message=f"抓取账号「{name}」时主页弹出登录墙，登录态掉线或被降级。"
-                             "请重新运行 login_bootstrap.py，并确认运行模式（有头/无头）与登录时一致。")
-                shutdown(browser, ctx)
-                return
-            except Exception as e:
-                summary["errors"].append({"account": name, "error": f"主页抓取失败: {e}"})
-                continue
+            # v1.4.2 恢复循环：on_card 置 recover 时回主页重进继续抓，最多 2 次
+            cards, reloads = [], 0
+            while True:
+                try:
+                    cards, _ = iterate_profile_cards(page, on_card, max_rounds, stable_rounds)
+                except LoginWallError:
+                    emit(status="need_login",
+                         message=f"抓取账号「{name}」时主页弹出登录墙，登录态掉线或被降级。"
+                                 "请重新运行 login_bootstrap.py，并确认运行模式（有头/无头）与登录时一致。")
+                    shutdown(browser, ctx)
+                    return
+                except Exception as e:
+                    summary["errors"].append({"account": name, "error": f"主页抓取失败: {e}"})
+                    break
+                if run["recover"] and run["stop"] != "blocked":
+                    if reloads >= 2:
+                        summary["errors"].append({"account": name,
+                            "error": "详情墙/卡片回收反复出现，回主页恢复 2 次仍失败，账号本轮中止"})
+                        break
+                    reloads += 1
+                    run["recover"] = None
+                    human_delay(*delay)
+                    try:
+                        recover_profile(page, url)
+                    except Exception as e:
+                        summary["errors"].append({"account": name,
+                                                  "error": f"回主页恢复失败: {e}"})
+                        break
+                    continue
+                break
 
             if run["stop"] == "blocked":
                 emit(status="blocked",
