@@ -1,10 +1,9 @@
 """日抓：发现各监测账号的新发布笔记，并采集其首组互动指标。
 
-流程：校验登录 → 逐账号滚动主页采集卡片（滚到不再加载为止）
-     → 与 notes.jsonl 比对识别新增 → 对新增笔记「点击卡片开模态」采赞/藏/评/发布时间
-     （禁止直跳详情页 URL，会触发 App 扫码风控墙）
-     → 追加 notes.jsonl / metrics.jsonl → 输出 JSON 摘要（含 validation 自检）。
-存量笔记的指标刷新由 weekly.py 负责，日抓不重复回访。
+流程（v1.4 边滚边处理）：校验登录 → 逐账号滚动主页，每轮对当前 DOM 内的新卡片
+立即点击开模态采「赞/藏/评/发布时间」（XHS 虚拟滚动会回收屏幕外卡片 DOM，
+先收集再回头点必然 anchor not found）→ 追加 notes.jsonl / metrics.jsonl
+→ 输出 JSON 摘要（含 validation 自检）。存量笔记指标刷新由 weekly.py 负责。
 """
 import os
 import sys
@@ -13,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import (NOTES_PATH, METRICS_PATH, ensure_playwright, launch, shutdown,
                     has_login_state, check_login, detect_block, human_delay,
                     append_jsonl, load_jsonl, load_config, parse_count,
-                    parse_publish_time, today_str, scroll_collect_cards,
+                    parse_publish_time, today_str, iterate_profile_cards,
                     LoginWallError, open_note_modal, close_note_modal,
                     extract_detail_guarded, validate_detail, confidence,
                     save_validation_shot, emit)  # noqa: E402
@@ -66,7 +65,79 @@ def main():
             try:
                 page.goto(url, timeout=45000, wait_until="domcontentloaded")
                 page.wait_for_timeout(4000)
-                cards = scroll_collect_cards(page, max_rounds, stable_rounds)
+            except Exception as e:
+                summary["errors"].append({"account": name, "error": f"主页打开失败: {e}"})
+                continue
+
+            run = {"budget": budget, "stop": None, "acc_new": 0}
+
+            def on_card(c):
+                """对当前 DOM 内的一张新卡片立即处理；返回 False 中止整个账号。"""
+                nid = c["note_id"]
+                if nid in known:
+                    return True
+                if run["budget"] <= 0:
+                    summary["errors"].append({"account": name,
+                                              "error": "详情页访问预算耗尽，剩余新笔记明日补抓"})
+                    return False
+                run["budget"] -= 1
+                try:
+                    open_note_modal(page, nid)
+                except Exception as e:
+                    summary["errors"].append({"account": name, "note_id": nid,
+                                              "error": f"模态打开失败: {e}"})
+                    return True
+
+                d, walled = extract_detail_guarded(page, nid, cooldown)
+                val["total_details"] += 1
+                if walled:
+                    val["detail_wall_hits"] += 1
+                    shot = save_validation_shot(page, nid)
+                    if shot:
+                        val["screenshots"].append(shot)
+                    run["stop"] = "blocked"
+                    return False
+
+                missing = validate_detail(d)
+                if missing:
+                    val["bad_details"] += 1
+                    shot = save_validation_shot(page, nid)
+                    if shot:
+                        val["screenshots"].append(shot)
+                    summary["errors"].append({"account": name, "note_id": nid,
+                                              "error": f"自检缺失字段: {','.join(missing)}"})
+
+                # v1.3 标题一致性校验：不一致记 title_mismatch，以详情页为准
+                card_title = (c.get("title") or "").strip()
+                detail_title = (d.get("title") or "").strip() if d else ""
+                if card_title and detail_title and card_title != detail_title:
+                    summary["errors"].append({
+                        "account": name, "note_id": nid,
+                        "error": f"title_mismatch: 卡片[{card_title[:20]}] != 详情[{detail_title[:20]}]，已采用详情标题"})
+
+                append_jsonl(NOTES_PATH, {
+                    "note_id": nid, "url": c["url"],
+                    "account": name, "type": acc.get("type", "competitor"),
+                    "title": detail_title or card_title,
+                    "publish_time": parse_publish_time(d.get("date")) if d else None,
+                    "first_seen": today,
+                })
+                append_jsonl(METRICS_PATH, {
+                    "note_id": nid, "account": name, "date": today,
+                    "likes": (parse_count(d.get("like")) if d else None)
+                             or parse_count(c.get("likes_text")),
+                    "collects": parse_count(d.get("collect")) if d else None,
+                    "comments": parse_count(d.get("comment")) if d else None,
+                    "views": None, "source": "frontend",
+                })
+                known.add(nid)
+                run["acc_new"] += 1
+                close_note_modal(page)
+                human_delay(*delay)
+                return True
+
+            try:
+                cards, _ = iterate_profile_cards(page, on_card, max_rounds, stable_rounds)
             except LoginWallError:
                 emit(status="need_login",
                      message=f"抓取账号「{name}」时主页弹出登录墙，登录态掉线或被降级。"
@@ -77,87 +148,23 @@ def main():
                 summary["errors"].append({"account": name, "error": f"主页抓取失败: {e}"})
                 continue
 
+            if run["stop"] == "blocked":
+                emit(status="blocked",
+                     message="详情页持续命中「App 扫码查看」风控墙（冷却重试后仍被拦截），已熔断。"
+                             "建议 1-2 小时后或明日恢复任务；本地跑可用 XHS_HEADLESS=0 有头模式降低触发率。")
+                shutdown(browser, ctx)
+                return
+
             if detect_block(page):
                 emit(status="blocked",
                      message=f"抓取账号「{name}」时触发风控，已熔断。请手动打开小红书完成一次验证，明日再恢复任务。")
                 shutdown(browser, ctx)
                 return
 
-            if not cards:
-                summary["errors"].append({"account": name,
-                                          "error": "未采到任何卡片（页面结构异常或未加载），已跳过"})
-                continue
-
-            new_cards = [c for c in cards if c["note_id"] not in known]
-            acc_new = 0
-            for c in new_cards:
-                if budget <= 0:
-                    summary["errors"].append({"account": name,
-                                              "error": "详情页访问预算耗尽，剩余新笔记明日补抓"})
-                    break
-                budget -= 1
-                try:
-                    open_note_modal(page, c["note_id"])
-                except Exception as e:
-                    summary["errors"].append({"account": name, "note_id": c["note_id"],
-                                              "error": f"模态打开失败: {e}"})
-                    continue
-
-                d, walled = extract_detail_guarded(page, c["note_id"], cooldown)
-                val["total_details"] += 1
-                if walled:
-                    val["detail_wall_hits"] += 1
-                    shot = save_validation_shot(page, c["note_id"])
-                    if shot:
-                        val["screenshots"].append(shot)
-                    emit(status="blocked",
-                         message="详情页持续命中「App 扫码查看」风控墙（冷却重试后仍被拦截），已熔断。"
-                                 "建议 1-2 小时后或明日恢复任务；本地跑可用 XHS_HEADLESS=0 有头模式降低触发率。")
-                    shutdown(browser, ctx)
-                    return
-
-                missing = validate_detail(d)
-                if missing:
-                    val["bad_details"] += 1
-                    shot = save_validation_shot(page, c["note_id"])
-                    if shot:
-                        val["screenshots"].append(shot)
-                    summary["errors"].append({"account": name, "note_id": c["note_id"],
-                                              "error": f"自检缺失字段: {','.join(missing)}"})
-
-                # v1.3 标题一致性校验：卡片标题与详情标题不一致时记录差异，
-                # 以详情页标题为准（详情页选择器经过实测验证，见 selectors.md §2）
-                card_title = (c.get("title") or "").strip()
-                detail_title = (d.get("title") or "").strip() if d else ""
-                if card_title and detail_title and card_title != detail_title:
-                    summary["errors"].append({
-                        "account": name, "note_id": c["note_id"],
-                        "error": f"title_mismatch: 卡片[{card_title[:20]}] != 详情[{detail_title[:20]}]，已采用详情标题"})
-
-                note = {
-                    "note_id": c["note_id"], "url": c["url"],
-                    "account": name, "type": acc.get("type", "competitor"),
-                    "title": detail_title or card_title,
-                    "publish_time": parse_publish_time(d.get("date")) if d else None,
-                    "first_seen": today,
-                }
-                append_jsonl(NOTES_PATH, note)
-                append_jsonl(METRICS_PATH, {
-                    "note_id": c["note_id"], "account": name, "date": today,
-                    "likes": (parse_count(d.get("like")) if d else None)
-                             or parse_count(c.get("likes_text")),
-                    "collects": parse_count(d.get("collect")) if d else None,
-                    "comments": parse_count(d.get("comment")) if d else None,
-                    "views": None, "source": "frontend",
-                })
-                known.add(c["note_id"])
-                acc_new += 1
-                close_note_modal(page)
-                human_delay(*delay)
-
+            budget = run["budget"]
             summary["accounts"].append({
-                "name": name, "cards_seen": len(cards), "new_notes": acc_new})
-            summary["new_notes"] += acc_new
+                "name": name, "cards_seen": len(cards), "new_notes": run["acc_new"]})
+            summary["new_notes"] += run["acc_new"]
             human_delay(*delay)
 
         shutdown(browser, ctx)

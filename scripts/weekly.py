@@ -1,9 +1,9 @@
 """周刷：回访全部在监测笔记刷新指标，并生成环比周报。
 
-流程：校验登录 → 逐账号滚动主页采集卡片（滚到不再加载，覆盖老帖）
-     → 对 90 天内在册笔记逐一点击卡片开模态刷新指标（禁止直跳 URL）
-     → 追加 metrics.jsonl → 与 7 天前快照比对算环比
-     → 生成 Markdown 周报到 knowledge-base/reports/。
+流程（v1.4 边滚边处理）：校验登录 → 逐账号滚动主页，每轮对当前 DOM 内的在册笔记
+立即点击开模态刷新指标（XHS 虚拟滚动会回收屏幕外卡片 DOM，禁止先收集再回头点）
+→ 追加 metrics.jsonl → 与 7 天前快照比对算环比
+→ 生成 Markdown 周报到 knowledge-base/reports/。
 """
 import os
 import sys
@@ -14,7 +14,7 @@ from common import (NOTES_PATH, METRICS_PATH, REPORTS_DIR, CST,
                     ensure_playwright, launch, shutdown, has_login_state,
                     check_login, detect_block, human_delay, append_jsonl,
                     load_jsonl, load_config, parse_count, today_str,
-                    scroll_collect_cards, LoginWallError,
+                    iterate_profile_cards, LoginWallError,
                     open_note_modal, close_note_modal, extract_detail_guarded,
                     validate_detail, confidence, save_validation_shot, emit)  # noqa: E402
 
@@ -131,10 +131,7 @@ def main():
         emit(status="ok", message="库内无在监测笔记，请先跑 daily.py", refreshed=0)
         return
 
-    by_account = {}
-    for n in active:
-        by_account.setdefault(n["account"], []).append(n)
-
+    active_ids = {n["note_id"]: n for n in active}
     errors, refreshed = [], 0
     val = {"total_details": 0, "bad_details": 0, "detail_wall_hits": 0,
            "screenshots": [], "skipped_unseen": 0}
@@ -151,14 +148,64 @@ def main():
 
         for acc in cfg.get("accounts", []):
             name, url = acc.get("name"), acc.get("profile_url", "")
-            acc_notes = by_account.get(name, [])
-            if not acc_notes or "/user/profile/" not in url:
+            if "/user/profile/" not in url:
                 continue
             try:
                 page.goto(url, timeout=45000, wait_until="domcontentloaded")
                 page.wait_for_timeout(4000)
-                cards = scroll_collect_cards(page, max_rounds, stable_rounds)
-                seen = {c["note_id"] for c in cards}
+            except Exception as e:
+                errors.append({"account": name, "error": f"主页打开失败: {e}"})
+                continue
+
+            run = {"budget": budget, "stop": None}
+
+            def on_card(c):
+                """只处理在册笔记；返回 False 中止整个账号。"""
+                nid = c["note_id"]
+                if nid not in active_ids:
+                    return True
+                if run["budget"] <= 0:
+                    errors.append({"error": "详情页访问预算耗尽，其余笔记下周优先刷新"})
+                    return False
+                run["budget"] -= 1
+                nonlocal refreshed
+                try:
+                    open_note_modal(page, nid)
+                except Exception as e:
+                    errors.append({"note_id": nid, "error": f"模态打开失败: {e}"})
+                    return True
+
+                d, walled = extract_detail_guarded(page, nid, cooldown)
+                val["total_details"] += 1
+                if walled:
+                    val["detail_wall_hits"] += 1
+                    shot = save_validation_shot(page, nid)
+                    if shot:
+                        val["screenshots"].append(shot)
+                    run["stop"] = "blocked"
+                    return False
+
+                if validate_detail(d):
+                    val["bad_details"] += 1
+                    shot = save_validation_shot(page, nid)
+                    if shot:
+                        val["screenshots"].append(shot)
+                    errors.append({"note_id": nid, "error": "自检字段缺失，已记录截图"})
+
+                append_jsonl(METRICS_PATH, {
+                    "note_id": nid, "account": name, "date": today_s,
+                    "likes": parse_count(d.get("like")) if d else None,
+                    "collects": parse_count(d.get("collect")) if d else None,
+                    "comments": parse_count(d.get("comment")) if d else None,
+                    "views": None, "source": "frontend",
+                })
+                refreshed += 1
+                close_note_modal(page)
+                human_delay(*delay)
+                return True
+
+            try:
+                cards, _ = iterate_profile_cards(page, on_card, max_rounds, stable_rounds)
             except LoginWallError:
                 emit(status="need_login",
                      message=f"扫描账号「{name}」主页时弹出登录墙，登录态掉线或被降级。"
@@ -169,56 +216,23 @@ def main():
                 errors.append({"account": name, "error": f"主页扫描失败: {e}"})
                 continue
 
+            if run["stop"] == "blocked":
+                emit(status="blocked",
+                     message="详情页持续命中「App 扫码查看」风控墙，已熔断。"
+                             "建议 1-2 小时后或明日恢复；可用 XHS_HEADLESS=0 有头模式降低触发率。")
+                shutdown(browser, ctx)
+                return
+
             if detect_block(page):
                 emit(status="blocked", message="扫描主页时触发风控，已熔断。请手动验证后明日再试。")
                 shutdown(browser, ctx)
                 return
 
-            for n in acc_notes:
-                if n["note_id"] not in seen:
-                    val["skipped_unseen"] += 1  # 滚动到底仍未出现（可能被作者删除/隐藏）
-                    continue
-                if budget <= 0:
-                    errors.append({"error": "详情页访问预算耗尽，其余笔记下周优先刷新"})
-                    break
-                budget -= 1
-                try:
-                    open_note_modal(page, n["note_id"])
-                except Exception as e:
-                    errors.append({"note_id": n["note_id"], "error": f"模态打开失败: {e}"})
-                    continue
-
-                d, walled = extract_detail_guarded(page, n["note_id"], cooldown)
-                val["total_details"] += 1
-                if walled:
-                    val["detail_wall_hits"] += 1
-                    shot = save_validation_shot(page, n["note_id"])
-                    if shot:
-                        val["screenshots"].append(shot)
-                    emit(status="blocked",
-                         message="详情页持续命中「App 扫码查看」风控墙，已熔断。"
-                                 "建议 1-2 小时后或明日恢复；可用 XHS_HEADLESS=0 有头模式降低触发率。")
-                    shutdown(browser, ctx)
-                    return
-
-                if validate_detail(d):
-                    val["bad_details"] += 1
-                    shot = save_validation_shot(page, n["note_id"])
-                    if shot:
-                        val["screenshots"].append(shot)
-                    errors.append({"note_id": n["note_id"], "error": "自检字段缺失，已记录截图"})
-
-                append_jsonl(METRICS_PATH, {
-                    "note_id": n["note_id"], "account": n["account"], "date": today_s,
-                    "likes": parse_count(d.get("like")) if d else None,
-                    "collects": parse_count(d.get("collect")) if d else None,
-                    "comments": parse_count(d.get("comment")) if d else None,
-                    "views": None, "source": "frontend",
-                })
-                refreshed += 1
-                close_note_modal(page)
-                human_delay(*delay)
-
+            budget = run["budget"]
+            seen = {c["note_id"] for c in cards}
+            val["skipped_unseen"] += sum(
+                1 for nid, n in active_ids.items()
+                if n["account"] == name and nid not in seen)
             human_delay(*delay)
 
         shutdown(browser, ctx)

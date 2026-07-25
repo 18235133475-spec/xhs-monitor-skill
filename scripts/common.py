@@ -9,7 +9,6 @@
 v1.2：登录态改用持久化浏览器 profile（state/profile/），完整保留 cookies、
 localStorage、IndexedDB 与设备指纹，且每次运行指纹一致，显著优于 storage_state。
 注意：同一账号必须固定同一种运行模式（有头/无头二选一），混用会被平台降级。
-v1.3：卡片标题改「标题锚点自取」，详情标题砍掉 h1 宽泛兜底（标题错位事故修复）。
 """
 import json
 import os
@@ -182,16 +181,30 @@ def cool_down(seconds=90):
 
 
 # ---------------- 主页滚动采集 ----------------
+# 关键认知（v1.4）：XHS 主页是虚拟滚动，滚远的卡片会被回收出 DOM。
+# 因此「先滚到底收集、再回头点击」必然大面积 anchor not found——
+# 必须边滚边处理（iterate_profile_cards），卡片还在 DOM 时就完成点击提取。
 
-def scroll_collect_cards(page, max_rounds=40, stable_rounds=2, wait_ms=1800):
-    """滚动主页采集卡片，直到连续 stable_rounds 轮卡片数不再增长（或达上限）。
-    撞登录墙抛 LoginWallError。返回去重后的卡片列表。"""
-    cards, last_count, stable = {}, -1, 0
+def iterate_profile_cards(page, on_card, max_rounds=40, stable_rounds=2, wait_ms=1800):
+    """滚动主页，对每轮出现在 DOM 中的新卡片立即回调处理。
+    on_card(card) -> bool：返回 False 立即中止整体迭代（预算耗尽/需要熔断）。
+    撞登录墙抛 LoginWallError。
+    返回 (cards, aborted)：cards 为全程见过的去重卡片列表。"""
+    cards, processed = {}, set()
+    last_count, stable, aborted = -1, 0, False
     for _ in range(max_rounds):
         if detect_login_wall(page):
             raise LoginWallError("主页弹出登录墙，登录态掉线或被平台降级")
         for c in page.evaluate(EXTRACT_CARDS_JS):
             cards[c["note_id"]] = c
+            if c["note_id"] in processed:
+                continue
+            processed.add(c["note_id"])
+            if on_card(c) is False:
+                aborted = True
+                break
+        if aborted:
+            break
         if len(cards) == last_count:
             stable += 1
             if stable >= stable_rounds:
@@ -201,7 +214,14 @@ def scroll_collect_cards(page, max_rounds=40, stable_rounds=2, wait_ms=1800):
             last_count = len(cards)
         page.mouse.wheel(0, 2200)
         page.wait_for_timeout(wait_ms)
-    return list(cards.values())
+    return list(cards.values()), aborted
+
+
+def scroll_collect_cards(page, max_rounds=40, stable_rounds=2, wait_ms=1800):
+    """兼容旧调用：纯滚动采集不处理卡片。新代码请用 iterate_profile_cards。"""
+    cards, _ = iterate_profile_cards(page, lambda c: True, max_rounds,
+                                     stable_rounds, wait_ms)
+    return cards
 
 
 # ---------------- 详情页模态操作 ----------------

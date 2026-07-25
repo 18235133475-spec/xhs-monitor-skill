@@ -29,26 +29,36 @@ curl -L https://raw.githubusercontent.com/18235133475-spec/xhs-monitor-skill/mai
 | 变量 | 作用 |
 |---|---|
 | `XHS_RUNTIME_DIR` | 覆盖运行目录（默认 `/mnt/agents/xhs-monitor`；macOS 示例 `~/.openclaw/workspace/agents/xhs-monitor`），无需改源码 |
-| `XHS_HEADLESS` | 设 `0` 为有头模式（本地 Mac 推荐，撞风控墙率低）。**登录与日常运行必须固定同一模式** |
+| `XHS_HEADLESS` | 设 `0` 为有头模式（本地 Mac 推荐，撞风控墙率低） |
 | `XHS_CHROME_PATH` | 指定浏览器路径，如 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` |
 
-## 变更记录
+## v1.1 变更（2026-07-24）
 
-### v1.3（2026-07-25）
+- **详情页改模态点击进入**：禁止直跳详情 URL（xsec_token 与入口动作绑定，直跳必触发「请打开小红书App扫码查看」风控墙），改为主页点击卡片开模态提取
+- **撞墙冷却重试**：命中扫码墙冷却 90 秒重试一次，仍命中才熔断
+- **自检机制**：`validate_detail` 字段校验 + 失败截图存证 + validation 置信度报告
+- **路径/浏览器环境变量化**：`XHS_RUNTIME_DIR` / `XHS_HEADLESS` / `XHS_CHROME_PATH`
+- weekly 不再依赖存储的详情 URL，xsec_token 过期问题消除
 
-- **修复标题错位事故**：卡片标题废弃容器内 `.title` 宽泛查询（容器解析错误会取到别篇标题），改为「类名含 title 且 href 同含 note_id 的标题锚点」自身文本，封面 img alt 兜底
-- **详情标题砍兜底**：仅保留 `#detail-title` / `.note-content .title`（实测 `h1[class*="title"]` 会命中正文小标题）
-- **标题一致性校验**：卡片标题与详情标题不一致时记 `title_mismatch`，以详情页为准
+## v1.2 变更（2026-07-25）
 
-### v1.2（2026-07-24）
+- **滚动到底全量采集**：主页滚动直至卡片数不再增长（`scroll.max_rounds`/`stable_rounds` 可配），修复只采到前 18 篇的问题
+- **登录态持久化**：优先 `launch_persistent_context` 持久化 profile（含 IndexedDB/设备指纹），不支持时回落 storage_state
+- **登录墙识别**：主页出现「登录即可查看 Ta 的笔记」时明确报 `need_login`，不再当作空账号
+- **模态点击兜底**：locator 点击失败时 evaluate 内 querySelector+scrollIntoView+click
+- **登录态纪律**：同一账号固定有头/无头模式，混用会导致指纹漂移被降级
 
-- 滚动到底采集（修复「只采到首屏 18 篇」）
-- 持久化 profile 登录态，解决扫码登录态短命掉线
-- 登录墙识别、模态点击 JS 兜底、登录态纪律（固定有头/无头模式）
+## v1.3 变更（2026-07-25）
 
-### v1.1（2026-07-24）
+- **修复标题错位**：卡片标题改「标题锚点自取」（类名含 title 且 href 含 note_id 的 `<a>` 文本）+ 封面 img alt 兜底，不再用宽泛的 `[class*="title"]`（会命中正文小标题/别篇标题）
+- **详情标题收紧**：仅 `#detail-title` / `.note-content .title`
+- **一致性校验**：daily 对卡片标题与详情标题做 title_mismatch 检查，以详情为准
 
-- 详情页改模态点击进入（直跳 URL 必触发「App 扫码查看」风控墙）
-- 撞墙冷却重试、自检机制、环境变量化
+## v1.4 变更（2026-07-25）
+
+- **修复 `anchor not found` 批量失败**：根因是 XHS 主页虚拟滚动会回收屏幕外卡片的 DOM，「先滚到底收集再回头点击」时早期卡片已不在 DOM 中
+- **改边滚边处理**：新增 `iterate_profile_cards`，每轮滚动对新出现在 DOM 中的卡片立即回调处理（打开模态→提取→关闭），daily/weekly 均重构为该模式
+- `scroll_collect_cards` 保留为兼容包装
+- 已用虚拟滚动回收的合成 fixture 实测：40 张卡全部在 DOM 存活期内完成处理，0 缺失
 
 运行规则、选择器维护、数据 schema 详见 `references/` 目录。
