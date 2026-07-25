@@ -175,7 +175,13 @@ def main():
                     errors.append({"note_id": nid, "error": f"模态打开失败: {e}"})
                     return True
 
-                d, walled = extract_detail_guarded(page, nid, cooldown)
+                try:
+                    d, walled = extract_detail_guarded(page, nid, cooldown)
+                except Exception as e:
+                    # v1.4.1 总兜底：单卡任何异常只记错误、跳过，绝不中止整轮
+                    errors.append({"note_id": nid, "error": f"详情提取失败: {e}"})
+                    close_note_modal(page)
+                    return True
                 val["total_details"] += 1
                 if walled:
                     val["detail_wall_hits"] += 1

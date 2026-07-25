@@ -61,4 +61,9 @@ curl -L https://raw.githubusercontent.com/18235133475-spec/xhs-monitor-skill/mai
 - `scroll_collect_cards` 保留为兼容包装
 - 已用虚拟滚动回收的合成 fixture 实测：40 张卡全部在 DOM 存活期内完成处理，0 缺失
 
+## v1.4.1 变更（2026-07-25）
+
+- **修复撞墙冷却重开炸穿整轮**：撞扫码墙→冷却 90 秒→重新点击卡片时，卡片可能已被虚拟滚动回收，未捕获的 `anchor not found` 会以「主页抓取失败」中止整个账号；现重开失败只放弃该条（不入库、次日补抓）
+- **on_card 总兜底**：daily/weekly 中单卡详情的任何异常只记错误并跳过，绝不上抛中止整轮
+
 运行规则、选择器维护、数据 schema 详见 `references/` 目录。

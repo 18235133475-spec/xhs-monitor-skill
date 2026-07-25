@@ -255,13 +255,19 @@ def close_note_modal(page):
 
 def extract_detail_guarded(page, note_id, cooldown_seconds=90):
     """模态内提取详情；撞扫码墙则冷却重试一次。
-    返回 (data, walled)：walled=True 表示冷却重试后仍被拦截，调用方应熔断。"""
+    返回 (data, walled)：walled=True 表示冷却重试后仍被拦截，调用方应熔断。
+    (None, False) 表示冷却重开时卡片已被回收，调用方应跳过该条次日补抓。"""
     for attempt in (1, 2):
         if detect_detail_unavailable(page):
             if attempt == 1:
                 close_note_modal(page)
                 cool_down(cooldown_seconds)
-                open_note_modal(page, note_id)
+                try:
+                    open_note_modal(page, note_id)
+                except Exception:
+                    # v1.4.1：冷却期间卡片可能已被虚拟滚动回收/Escape 后 DOM 变化，
+                    # 重开找不到锚点不算撞墙——放弃本条（明日补抓），绝不上抛炸穿整轮
+                    return None, False
                 continue
             return None, True
         return page.evaluate(EXTRACT_DETAIL_JS), False

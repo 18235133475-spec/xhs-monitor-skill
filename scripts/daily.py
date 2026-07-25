@@ -88,7 +88,14 @@ def main():
                                               "error": f"模态打开失败: {e}"})
                     return True
 
-                d, walled = extract_detail_guarded(page, nid, cooldown)
+                try:
+                    d, walled = extract_detail_guarded(page, nid, cooldown)
+                except Exception as e:
+                    # v1.4.1 总兜底：单卡任何异常只记错误、跳过，绝不中止整轮
+                    summary["errors"].append({"account": name, "note_id": nid,
+                                              "error": f"详情提取失败: {e}"})
+                    close_note_modal(page)
+                    return True
                 val["total_details"] += 1
                 if walled:
                     val["detail_wall_hits"] += 1
@@ -97,6 +104,13 @@ def main():
                         val["screenshots"].append(shot)
                     run["stop"] = "blocked"
                     return False
+
+                if d is None:
+                    # 冷却重开后卡片被回收：不入库、不标记 known，明日补抓
+                    summary["errors"].append({"account": name, "note_id": nid,
+                                              "error": "冷却重开后卡片已回收，跳过待明日补抓"})
+                    close_note_modal(page)
+                    return True
 
                 missing = validate_detail(d)
                 if missing:
